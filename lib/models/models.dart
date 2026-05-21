@@ -6,3 +6,4 @@ export 'schedule.dart';
 export 'poem_error.dart';
 export 'check_in.dart';
 export 'math_recording.dart';
+export 'daily_task.dart';
