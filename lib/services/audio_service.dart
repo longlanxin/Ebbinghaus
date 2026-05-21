@@ -1,214 +1,121 @@
 import 'dart:async';
-import 'package:speech_to_text/speech_to_text.dart';
+import 'dart:io';
+import 'package:path_provider/path_provider.dart';
+import 'package:path/path.dart' as path;
+import 'package:record/record.dart';
+import 'package:audioplayers/audioplayers.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 // ============================================================
-// 语音关键词识别服务 - 单例模式
-// 负责语音识别和语音指令解析，全程无需触碰屏幕
+// 音频录制服务 - 单例模式
+// 负责数学答题录音的录制、播放和管理
+// 使用 record 包录制，audioplayers 播放
 // ============================================================
 
-// ==================== 语音指令常量 ====================
+/// 录音文件默认保存的子目录名
+const String _kRecordingDir = 'recordings';
 
-/// 开始听写指令
-const List<String> _kStartCommands = ['开始', '开始听写'];
+/// 录音文件格式
+const String _kRecordingFormat = '.m4a';
 
-/// 重复当前指令
-const List<String> _kRepeatCommands = ['再说一遍', '重复'];
+/// 保留的最大录音文件数量（默认30条）
+const int _kDefaultKeepCount = 30;
 
-/// 语速调慢指令
-const List<String> _kSlowerCommands = ['慢一点', '太快了'];
+/// 录音采样率（Hz）
+const int _kSampleRate = 44100;
 
-/// 语速调快指令
-const List<String> _kFasterCommands = ['快一点'];
+/// 录音比特率（bps）
+const int _kBitRate = 128000;
 
-/// 完成听写指令
-const List<String> _kFinishCommands = ['我完成了', '写完了'];
-
-/// 标记正确指令
-const List<String> _kCorrectCommands = ['正确', '对的'];
-
-/// 标记错误指令
-const List<String> _kWrongCommands = ['错了', '这个字错了'];
-
-/// 下一个指令
-const List<String> _kNextCommands = ['下一个'];
-
-/// 提交指令
-const List<String> _kSubmitCommands = ['提交'];
-
-/// 识别超时时间（毫秒），超过此时间无新结果则自动停止
-const int _kListenTimeoutMs = 5000;
-
-/// 语音识别的地区代码（中文）
-const String _kLocaleId = 'zh_CN';
-
-// ==================== 语音指令枚举 ====================
-
-/// 定义所有支持的语音指令类型
-enum VoiceCommand {
-  /// 开始听写
-  start,
-
-  /// 重复当前
-  repeat,
-
-  /// 语速调慢
-  slower,
-
-  /// 语速调快
-  faster,
-
-  /// 完成当前
-  finish,
-
-  /// 标记正确
-  correct,
-
-  /// 标记错误
-  wrong,
-
-  /// 下一个
-  next,
-
-  /// 提交
-  submit,
-
-  /// 未知/未匹配指令
-  unknown,
-}
-
-/// 语音指令结果
-class CommandResult {
-  /// 指令类型
-  final VoiceCommand command;
-
-  /// 原始识别文字
-  final String rawText;
-
-  /// 识别置信度（如引擎提供）
-  final double? confidence;
-
-  /// 识别时间
-  final DateTime recognizedAt;
-
-  CommandResult({
-    required this.command,
-    required this.rawText,
-    this.confidence,
-    DateTime? recognizedAt,
-  }) : recognizedAt = recognizedAt ?? DateTime.now();
-}
-
-class SpeechService {
+class AudioService {
   // ==================== 单例模式 ====================
-  static final SpeechService _instance = SpeechService._internal();
-  factory SpeechService() => _instance;
-  SpeechService._internal();
+  static final AudioService _instance = AudioService._internal();
+  factory AudioService() => _instance;
+  AudioService._internal();
 
   // ==================== 成员变量 ====================
 
-  /// SpeechToText实例
-  final SpeechToText _speechToText = SpeechToText();
+  /// 录音器实例
+  final Record _recorder = Record();
+
+  /// 音频播放器实例
+  AudioPlayer? _player;
 
   /// 是否已初始化
   bool _initialized = false;
 
-  /// 语音识别是否可用
-  bool _isAvailable = false;
+  /// 是否正在录音中
+  bool _isRecording = false;
 
-  /// 是否有录音权限
-  bool _hasPermission = false;
+  /// 是否正在播放中
+  bool _isPlaying = false;
 
-  /// 是否正在监听
-  bool _isListening = false;
+  /// 当前录音文件路径
+  String? _currentRecordingPath;
 
-  /// 命令流控制器
-  StreamController<CommandResult>? _commandController;
+  /// 录音开始时间（用于计算录音时长）
+  DateTime? _recordingStartTime;
 
-  /// 识别结果流
-  StreamController<String>? _resultController;
+  /// 录音完成回调
+  Function(String filePath, Duration duration)? _onRecordingComplete;
 
-  /// 监听超时定时器
-  Timer? _listenTimeoutTimer;
+  /// 播放状态变化回调
+  Function(bool isPlaying)? _onPlayingStateChanged;
 
-  /// 最后一次识别的文字（用于去重）
-  String _lastRecognizedText = '';
+  /// 录音错误回调
+  Function(String error)? _onError;
 
-  /// 同一识别文本的重复次数（用于防抖）
-  int _repeatCount = 0;
-
-  /// 上一次识别结果的时间
-  DateTime? _lastRecognizeTime;
+  /// 私有录音目录路径（缓存）
+  String? _recordingDirectoryPath;
 
   // ==================== Getter ====================
 
-  /// 是否正在监听中
-  bool get isListening => _isListening;
+  /// 是否正在录音
+  bool get isRecording => _isRecording;
 
-  /// 语音识别是否可用
-  bool get isAvailable => _isAvailable;
+  /// 是否正在播放
+  bool get isPlaying => _isPlaying;
 
-  /// 命令流（供外部订阅）
-  Stream<CommandResult> get commandStream {
-    _commandController ??= StreamController<CommandResult>.broadcast();
-    return _commandController!.stream;
-  }
+  /// 当前录音文件路径
+  String? get currentRecordingPath => _currentRecordingPath;
 
-  /// 原始识别结果流
-  Stream<String> get resultStream {
-    _resultController ??= StreamController<String>.broadcast();
-    return _resultController!.stream;
+  /// 获取当前录音时长（毫秒）
+  int? get currentRecordingDurationMs {
+    if (_recordingStartTime == null || !_isRecording) return null;
+    return DateTime.now().difference(_recordingStartTime!).inMilliseconds;
   }
 
   // ==================== 初始化 ====================
 
-  /// 初始化语音识别服务
-  /// - 检测系统是否支持语音识别
-  /// - 检查并请求权限
+  /// 初始化音频服务
+  /// - 请求录音权限
+  /// - 创建录音文件保存目录
+  /// - 初始化音频播放器
   Future<void> initialize() async {
     if (_initialized) return;
 
     try {
-      // 先检查权限
-      _hasPermission = await hasPermission();
+      // 创建录音目录
+      await _ensureRecordingDirectory();
 
-      // 初始化SpeechToText
-      _isAvailable = await _speechToText.initialize(
-        onError: (error) => _handleError(error),
-        onStatus: (status) => _handleStatus(status),
-      );
+      // 初始化播放器
+      _player = AudioPlayer();
+
+      // 监听播放器状态
+      _player!.onPlayerComplete.listen((_) {
+        _isPlaying = false;
+        _onPlayingStateChanged?.call(false);
+      });
+
+      _player!.onPlayerStateChanged.listen((state) {
+        _isPlaying = state == PlayerState.playing;
+        _onPlayingStateChanged?.call(_isPlaying);
+      });
 
       _initialized = true;
     } catch (e) {
-      _isAvailable = false;
       _initialized = true;
-    }
-  }
-
-  // ==================== 状态/错误处理 ====================
-
-  /// 处理语音识别状态变化
-  void _handleStatus(String status) {
-    switch (status) {
-      case 'listening':
-        _isListening = true;
-        break;
-      case 'notListening':
-        _isListening = false;
-        break;
-      case 'done':
-        _isListening = false;
-        break;
-      default:
-        break;
-    }
-  }
-
-  /// 处理语音识别错误
-  void _handleError(dynamic error) {
-    // 如果是超时错误，自动重新开始监听
-    if (error != null && error.toString().contains('timeout')) {
-      // 超时后不做任何事，等待下一次调用startListening
+      _onError?.call('音频服务初始化失败: $e');
     }
   }
 
@@ -216,291 +123,391 @@ class SpeechService {
 
   /// 检查是否有录音权限
   Future<bool> hasPermission() async {
-    final status = await Permission.microphone.status;
-    _hasPermission = status.isGranted;
-    return _hasPermission;
+    try {
+      // 使用 permission_handler 检查麦克风权限
+      final status = await Permission.microphone.status;
+
+      if (status.isGranted) {
+        return true;
+      }
+
+      // 检查存储权限（Android需要）
+      if (Platform.isAndroid) {
+        final storageStatus = await Permission.storage.status;
+        if (!storageStatus.isGranted) {
+          return false;
+        }
+      }
+
+      return false;
+    } catch (e) {
+      return false;
+    }
   }
 
   /// 请求录音权限
   /// 返回 true 表示权限已授权
   Future<bool> requestPermission() async {
     try {
-      final status = await Permission.microphone.request();
-      _hasPermission = status.isGranted;
-      return _hasPermission;
+      // 请求麦克风权限
+      final micStatus = await Permission.microphone.request();
+      if (!micStatus.isGranted) {
+        return false;
+      }
+
+      // Android 额外请求存储权限
+      if (Platform.isAndroid) {
+        final storageStatus = await Permission.storage.request();
+        if (!storageStatus.isGranted) {
+          // 存储权限被拒绝，不影响基本录音功能
+        }
+      }
+
+      return true;
     } catch (e) {
       return false;
     }
   }
 
-  // ==================== 可用性检查 ====================
+  /// 确保录音目录存在
+  Future<void> _ensureRecordingDirectory() async {
+    if (_recordingDirectoryPath != null) return;
 
-  /// 检查语音识别是否可用
-  /// 需要同时满足：已初始化、系统支持、有权限
-  Future<bool> checkAvailable() async {
-    if (!_initialized) {
-      await initialize();
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final recordingDir = Directory(path.join(appDir.path, _kRecordingDir));
+
+      if (!await recordingDir.exists()) {
+        await recordingDir.create(recursive: true);
+      }
+
+      _recordingDirectoryPath = recordingDir.path;
+    } catch (e) {
+      // 使用临时目录作为降级
+      final tempDir = await getTemporaryDirectory();
+      final recordingDir = Directory(path.join(tempDir.path, _kRecordingDir));
+
+      if (!await recordingDir.exists()) {
+        await recordingDir.create(recursive: true);
+      }
+
+      _recordingDirectoryPath = recordingDir.path;
     }
-    if (!_hasPermission) {
-      _hasPermission = await hasPermission();
-    }
-    return _isAvailable && _hasPermission;
   }
 
-  // ==================== 监听控制 ====================
+  /// 获取录音文件保存路径
+  Future<String> _getRecordingPath() async {
+    await _ensureRecordingDirectory();
 
-  /// 开始语音监听
-  /// [onResult] 回调函数，每次识别到新文字时触发
-  /// [onCommand] 可选的命令回调，当识别到特定指令时触发
-  ///
-  /// 使用示例：
-  /// ```dart
-  /// speechService.startListening(
-  ///   onResult: (text) => print('识别到: $text'),
-  ///   onCommand: (cmd) => print('指令: $cmd'),
-  /// );
-  /// ```
-  void startListening({
-    Function(String)? onResult,
-    Function(VoiceCommand)? onCommand,
-  }) {
-    if (!_initialized) {
-      return;
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final fileName = 'recording_$timestamp$_kRecordingFormat';
+    final filePath = path.join(_recordingDirectoryPath!, fileName);
+
+    return filePath;
+  }
+
+  // ==================== 录音控制 ====================
+
+  /// 开始录音
+  /// 返回录音文件的保存路径
+  /// 如果权限不足返回 null
+  /// [onComplete] 录音完成时的回调（可选）
+  Future<String?> startRecording({
+    Function(String filePath, Duration duration)? onComplete,
+    Function(String error)? onError,
+  }) async {
+    if (!_initialized) await initialize();
+
+    // 检查权限
+    final hasMicPermission = await hasPermission();
+    if (!hasMicPermission) {
+      final granted = await requestPermission();
+      if (!granted) {
+        onError?.call('没有录音权限，请在设置中开启麦克风权限');
+        return null;
+      }
     }
 
-    if (!_hasPermission) {
-      return;
-    }
-
-    if (_isListening) {
-      // 已经在监听了，先停止
-      stopListening();
+    // 如果正在录音，先停止
+    if (_isRecording) {
+      await stopRecording();
     }
 
     try {
-      _isListening = true;
-      _lastRecognizedText = '';
-      _repeatCount = 0;
+      // 获取保存路径
+      final filePath = await _getRecordingPath();
+      _currentRecordingPath = filePath;
+      _onRecordingComplete = onComplete;
+      _onError = onError;
 
-      // 开始监听
-      _speechToText.listen(
-        onResult: (result) {
-          _handleListenResult(result, onResult, onCommand);
-        },
-        localeId: _kLocaleId,
-        listenMode: ListenMode.confirmation,
-        partialResults: true,
-        cancelOnError: false,
-        listenFor: const Duration(seconds: 30),
-        pauseFor: const Duration(seconds: 5),
+      // 开始录音
+      await _recorder.start(
+        path: filePath,
+        encoder: AudioEncoder.aacLc,
+        bitRate: _kBitRate,
+        samplingRate: _kSampleRate,
       );
 
-      // 启动超时定时器
-      _startTimeoutTimer();
+      _isRecording = true;
+      _recordingStartTime = DateTime.now();
+
+      return filePath;
     } catch (e) {
-      _isListening = false;
+      _isRecording = false;
+      onError?.call('开始录音失败: $e');
+      return null;
     }
   }
 
-  /// 处理监听结果
-  void _handleListenResult(
-    dynamic result,
-    Function(String)? onResult,
-    Function(VoiceCommand)? onCommand,
-  ) {
-    if (result == null) return;
+  /// 停止录音
+  /// 返回录音文件的最终路径
+  Future<String?> stopRecording() async {
+    if (!_isRecording) return _currentRecordingPath;
 
     try {
-      // speech_to_text 的 listen 回调 result 是 String 类型
-      final String recognizedText = result.toString();
-      if (recognizedText.isEmpty) return;
+      final filePath = await _recorder.stop();
+      _isRecording = false;
 
-      // 重置超时定时器
-      _resetTimeoutTimer();
+      // 计算录音时长
+      final duration = _recordingStartTime != null
+          ? DateTime.now().difference(_recordingStartTime!)
+          : Duration.zero;
 
-      // 防抖处理：如果识别文字和上次一样且时间间隔很短，则忽略
-      final now = DateTime.now();
-      if (recognizedText == _lastRecognizedText &&
-          _lastRecognizeTime != null &&
-          now.difference(_lastRecognizeTime!).inMilliseconds < 500) {
+      _recordingStartTime = null;
+
+      // 调用完成回调
+      if (filePath != null && _onRecordingComplete != null) {
+        _onRecordingComplete!(filePath, duration);
+      }
+
+      return filePath ?? _currentRecordingPath;
+    } catch (e) {
+      _isRecording = false;
+      _recordingStartTime = null;
+      _onError?.call('停止录音失败: $e');
+      return _currentRecordingPath;
+    }
+  }
+
+  /// 检查是否正在录音
+  /// 由于 record 包没有 isRecording() 方法，使用内部状态追踪
+  Future<bool> checkRecording() async {
+    return _isRecording;
+  }
+
+  // ==================== 播放控制 ====================
+
+  /// 播放指定路径的录音文件
+  /// [filePath] 录音文件路径
+  /// [onComplete] 播放完成回调（可选）
+  /// [onError] 播放错误回调（可选）
+  Future<void> playRecording(
+    String filePath, {
+    VoidCallback? onComplete,
+    Function(String error)? onError,
+  }) async {
+    if (!_initialized) await initialize();
+
+    // 如果正在播放其他录音，先停止
+    if (_isPlaying) {
+      await stopPlaying();
+    }
+
+    try {
+      // 检查文件是否存在
+      final file = File(filePath);
+      if (!await file.exists()) {
+        onError?.call('录音文件不存在: $filePath');
         return;
       }
 
-      // 检查是否有新增内容
-      if (recognizedText != _lastRecognizedText) {
-        _lastRecognizedText = recognizedText;
-        _lastRecognizeTime = now;
-        _repeatCount = 0;
-      }
+      // 播放录音
+      await _player?.play(DeviceFileSource(filePath));
+      _isPlaying = true;
 
-      // 发送到原始结果流
-      _resultController?.add(recognizedText);
-
-      // 调用结果回调
-      if (onResult != null) {
-        onResult(recognizedText);
-      }
-
-      // 解析指令
-      final command = _parseCommand(recognizedText);
-      if (command != VoiceCommand.unknown) {
-        final commandResult = CommandResult(
-          command: command,
-          rawText: recognizedText,
-          confidence: null,
-        );
-
-        // 发送到命令流
-        _commandController?.add(commandResult);
-
-        // 调用命令回调
-        if (onCommand != null) {
-          onCommand(command);
-        }
+      // 监听完成事件
+      if (onComplete != null) {
+        final subscription = _player?.onPlayerComplete.listen((_) {
+          onComplete();
+        });
+        // 一次性监听
+        Future.delayed(const Duration(seconds: 1), () {
+          subscription?.cancel();
+        });
       }
     } catch (e) {
-      // 处理结果时出错，忽略
+      _isPlaying = false;
+      onError?.call('播放录音失败: $e');
     }
   }
 
-  /// 启动超时定时器
-  void _startTimeoutTimer() {
-    _cancelTimeoutTimer();
-    _listenTimeoutTimer = Timer(
-      const Duration(milliseconds: _kListenTimeoutMs),
-      () {
-        // 超时后如果还在监听，自动停止
-        if (_isListening) {
-          stopListening();
-        }
-      },
-    );
-  }
-
-  /// 重置超时定时器
-  void _resetTimeoutTimer() {
-    _startTimeoutTimer();
-  }
-
-  /// 取消超时定时器
-  void _cancelTimeoutTimer() {
-    _listenTimeoutTimer?.cancel();
-    _listenTimeoutTimer = null;
-  }
-
-  /// 停止语音监听
-  void stopListening() {
+  /// 停止播放
+  Future<void> stopPlaying() async {
     try {
-      _isListening = false;
-      _cancelTimeoutTimer();
+      await _player?.stop();
+      _isPlaying = false;
+    } catch (e) {
+      // 忽略停止错误
+    }
+  }
 
-      if (_speechToText.isListening) {
-        _speechToText.stop();
+  // ==================== 文件管理 ====================
+
+  /// 删除指定路径的录音文件
+  /// [filePath] 要删除的文件路径
+  Future<void> deleteRecording(String filePath) async {
+    try {
+      // 如果正在播放该文件，先停止
+      if (_isPlaying && _currentRecordingPath == filePath) {
+        await stopPlaying();
+      }
+
+      final file = File(filePath);
+      if (await file.exists()) {
+        await file.delete();
+      }
+
+      // 如果是当前录音路径，清空
+      if (_currentRecordingPath == filePath) {
+        _currentRecordingPath = null;
       }
     } catch (e) {
-      // 停止时出错，忽略
+      // 删除失败，忽略
     }
   }
 
-  // ==================== 关键词匹配 ====================
+  /// 获取所有录音文件列表（按修改时间降序排列）
+  /// 返回文件路径和修改时间的列表
+  Future<List<Map<String, dynamic>>> getAllRecordings() async {
+    try {
+      await _ensureRecordingDirectory();
+      final dir = Directory(_recordingDirectoryPath!);
 
-  /// 从识别文字中解析指令
-  /// 返回匹配的指令类型，未匹配返回 unknown
-  VoiceCommand _parseCommand(String text) {
-    final normalized = text.trim();
+      if (!await dir.exists()) return [];
 
-    if (_kStartCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.start;
-    }
+      final files = await dir
+          .list()
+          .where((entity) =>
+              entity is File && entity.path.endsWith(_kRecordingFormat))
+          .toList();
 
-    if (_kRepeatCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.repeat;
-    }
+      // 按修改时间排序（最新的在前）
+      files.sort((a, b) {
+        final aStat = (a as File).statSync();
+        final bStat = (b as File).statSync();
+        return bStat.modified.compareTo(aStat.modified);
+      });
 
-    if (_kSlowerCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.slower;
-    }
-
-    if (_kFasterCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.faster;
-    }
-
-    if (_kFinishCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.finish;
-    }
-
-    if (_kCorrectCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.correct;
-    }
-
-    if (_kWrongCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.wrong;
-    }
-
-    if (_kNextCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.next;
-    }
-
-    if (_kSubmitCommands.any((cmd) => normalized.contains(cmd))) {
-      return VoiceCommand.submit;
-    }
-
-    return VoiceCommand.unknown;
-  }
-
-  /// 获取指令的中文描述（用于调试和UI显示）
-  static String commandToString(VoiceCommand command) {
-    switch (command) {
-      case VoiceCommand.start:
-        return '开始';
-      case VoiceCommand.repeat:
-        return '再说一遍';
-      case VoiceCommand.slower:
-        return '慢一点';
-      case VoiceCommand.faster:
-        return '快一点';
-      case VoiceCommand.finish:
-        return '我完成了';
-      case VoiceCommand.correct:
-        return '正确';
-      case VoiceCommand.wrong:
-        return '错了';
-      case VoiceCommand.next:
-        return '下一个';
-      case VoiceCommand.submit:
-        return '提交';
-      case VoiceCommand.unknown:
-        return '未知指令';
+      return files.map((file) {
+        final stat = (file as File).statSync();
+        return {
+          'path': file.path,
+          'size': stat.size,
+          'modifiedAt': stat.modified,
+          'name': path.basename(file.path),
+        };
+      }).toList();
+    } catch (e) {
+      return [];
     }
   }
 
-  /// 获取所有可用指令提示（用于UI展示）
-  List<String> getAvailableCommandHints() {
-    return [
-      '开始',
-      '再说一遍',
-      '慢一点',
-      '快一点',
-      '我完成了',
-      '正确',
-      '错了',
-      '下一个',
-      '提交',
-    ];
+  /// 清理旧录音文件
+  /// [keepCount] 保留的文件数量，默认 30 条
+  /// 保留最新的 keepCount 条，删除其余
+  Future<int> cleanupOldRecordings(int keepCount) async {
+    try {
+      final recordings = await getAllRecordings();
+
+      if (recordings.length <= keepCount) return 0;
+
+      int deletedCount = 0;
+      // 删除超出保留数量的旧文件
+      for (int i = keepCount; i < recordings.length; i++) {
+        final filePath = recordings[i]['path'] as String;
+
+        // 跳过正在播放的文件
+        if (_isPlaying && _currentRecordingPath == filePath) {
+          continue;
+        }
+
+        try {
+          final file = File(filePath);
+          if (await file.exists()) {
+            await file.delete();
+            deletedCount++;
+          }
+        } catch (e) {
+          // 单个文件删除失败，继续下一个
+        }
+      }
+
+      return deletedCount;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /// 获取录音文件总数
+  Future<int> getRecordingCount() async {
+    try {
+      final recordings = await getAllRecordings();
+      return recordings.length;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  /// 获取录音文件总大小（字节）
+  Future<int> getTotalSize() async {
+    try {
+      final recordings = await getAllRecordings();
+      int totalSize = 0;
+      for (final record in recordings) {
+        totalSize += record['size'] as int;
+      }
+      return totalSize;
+    } catch (e) {
+      return 0;
+    }
+  }
+
+  // ==================== 回调设置 ====================
+
+  /// 设置播放状态变化回调
+  void setPlayingStateChangedCallback(Function(bool isPlaying) callback) {
+    _onPlayingStateChanged = callback;
+  }
+
+  /// 设置错误回调
+  void setErrorCallback(Function(String error) callback) {
+    _onError = callback;
   }
 
   // ==================== 资源释放 ====================
 
-  /// 释放语音识别资源
+  /// 释放音频服务资源
   void dispose() {
     try {
-      _cancelTimeoutTimer();
-      stopListening();
-      _commandController?.close();
-      _resultController?.close();
-      _speechToText.cancel();
+      // 停止录音
+      if (_isRecording) {
+        _recorder.stop();
+      }
+
+      // 释放录音器
+      _recorder.dispose();
+
+      // 释放播放器
+      _player?.dispose();
+      _player = null;
+
+      // 取消定时器
+      _isRecording = false;
+      _isPlaying = false;
     } catch (e) {
       // 释放资源时出错，忽略
     }
   }
 }
+
+// 使用 Flutter 内置的 VoidCallback (typedef void Function())
