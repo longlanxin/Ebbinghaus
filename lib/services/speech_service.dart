@@ -311,18 +311,8 @@ class SpeechService {
     if (result == null) return;
 
     try {
-      // 获取识别的文字
-      String recognizedText = '';
-      double? confidence;
-
-      // speech_to_text 返回 SpeechRecognitionResult 对象
-      if (result is SpeechRecognitionResult) {
-        recognizedText = result.recognizedWords;
-        confidence = result.confidence;
-      } else if (result is Map) {
-        recognizedText = result['recognizedWords']?.toString() ?? '';
-      }
-
+      // speech_to_text 的 listen 回调 result 是 String 类型
+      final String recognizedText = result.toString();
       if (recognizedText.isEmpty) return;
 
       // 重置超时定时器
@@ -357,7 +347,7 @@ class SpeechService {
         final commandResult = CommandResult(
           command: command,
           rawText: recognizedText,
-          confidence: confidence,
+          confidence: null,
         );
 
         // 发送到命令流
